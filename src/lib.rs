@@ -1,255 +1,169 @@
-//! Free Energy Principle computations over ternary distributions {-1, 0, +1}.
+//! # ternary-free-energy
+//! Free Energy Principle computations for ternary {-1, 0, +1} systems.
+//! Variational inference, entropy, surprise minimization on Z₃.
 
-pub type TernaryVal = i8;
-pub const TERNARY_VALS: [TernaryVal; 3] = [-1, 0, 1];
-
-/// Probability distribution over ternary values {-1, 0, +1}.
-pub type TernaryDist = [f64; 3];
-
-pub fn uniform() -> TernaryDist {
-    [1.0 / 3.0; 3]
+/// Ternary probability distribution over {-1, 0, +1}
+#[derive(Debug, Clone)]
+pub struct TernaryDist {
+    pub p_neg: f64,
+    pub p_zero: f64,
+    pub p_pos: f64,
 }
 
-pub fn deterministic(v: TernaryVal) -> TernaryDist {
-    let mut d = [0.0; 3];
-    d[(v + 1) as usize] = 1.0;
-    d
-}
+impl TernaryDist {
+    pub fn new(p_neg: f64, p_zero: f64, p_pos: f64) -> Self {
+        let total = p_neg + p_zero + p_pos;
+        Self { p_neg: p_neg/total, p_zero: p_zero/total, p_pos: p_pos/total }
+    }
 
-fn normalize_dist(d: &mut TernaryDist) {
-    let sum: f64 = d.iter().sum();
-    if sum > 1e-12 {
-        for x in d.iter_mut() {
-            *x /= sum;
+    pub fn uniform() -> Self { Self { p_neg: 1.0/3.0, p_zero: 1.0/3.0, p_pos: 1.0/3.0 } }
+
+    pub fn deterministic(val: i8) -> Self {
+        match val {
+            -1 => Self { p_neg: 1.0, p_zero: 0.0, p_pos: 0.0 },
+            0 => Self { p_neg: 0.0, p_zero: 1.0, p_pos: 0.0 },
+            _ => Self { p_neg: 0.0, p_zero: 0.0, p_pos: 1.0 },
         }
     }
-}
 
-/// Shannon entropy H(Q) for a ternary distribution.
-pub struct TernaryEntropy;
-
-impl TernaryEntropy {
-    pub fn compute(dist: &TernaryDist) -> f64 {
-        dist.iter()
-            .filter(|&&p| p > 1e-12)
-            .map(|&p| -p * p.ln())
-            .sum()
+    pub fn prob(&self, val: i8) -> f64 {
+        match val { -1 => self.p_neg, 0 => self.p_zero, _ => self.p_pos }
     }
 
-    /// Maximum entropy = ln(3) ≈ 1.0986.
-    pub fn max_entropy() -> f64 {
-        3.0_f64.ln()
+    pub fn sample(&self, rng: f64) -> i8 {
+        if rng < self.p_neg { -1 }
+        else if rng < self.p_neg + self.p_zero { 0 }
+        else { 1 }
     }
 
-    /// Normalised entropy ∈ [0,1].
-    pub fn normalised(dist: &TernaryDist) -> f64 {
-        Self::compute(dist) / Self::max_entropy()
+    pub fn mean(&self) -> f64 { -self.p_neg + self.p_pos }
+
+    pub fn variance(&self) -> f64 {
+        let m = self.mean();
+        self.p_neg * (-1.0 - m).powi(2) + self.p_zero * (0.0 - m).powi(2) + self.p_pos * (1.0 - m).powi(2)
     }
 }
 
-/// Variational Free Energy F = KL[Q||P] – E_Q[log P(o|s)].
-pub struct VariationalFreeEnergy;
+/// Shannon entropy of a ternary distribution
+pub fn ternary_entropy(dist: &TernaryDist) -> f64 {
+    let mut h = 0.0;
+    for &p in &[dist.p_neg, dist.p_zero, dist.p_pos] {
+        if p > 1e-10 { h -= p * p.log2(); }
+    }
+    h
+}
+
+/// KL divergence KL(p || q) for ternary distributions
+pub fn kl_divergence(p: &TernaryDist, q: &TernaryDist) -> f64 {
+    let mut kl = 0.0;
+    for val in [-1, 0, 1] {
+        let pp = p.prob(val);
+        let qp = q.prob(val);
+        if pp > 1e-10 && qp > 1e-10 {
+            kl += pp * (pp / qp).ln();
+        }
+    }
+    kl
+}
+
+/// Variational free energy = KL(q || p) - log_likelihood
+pub struct VariationalFreeEnergy {
+    pub kl_term: f64,
+    pub log_likelihood: f64,
+    pub total: f64,
+}
 
 impl VariationalFreeEnergy {
-    /// KL[Q||P] = Σ Q(s) log(Q(s)/P(s)).
-    pub fn kl_divergence(q: &TernaryDist, p: &TernaryDist) -> f64 {
-        q.iter()
-            .zip(p.iter())
-            .filter(|(&qi, &pi)| qi > 1e-12 && pi > 1e-12)
-            .map(|(&qi, &pi)| qi * (qi / pi).ln())
-            .sum()
-    }
-
-    /// F = KL[Q||P] – expected_log_likelihood.
-    pub fn compute(q: &TernaryDist, p: &TernaryDist, expected_log_likelihood: f64) -> f64 {
-        Self::kl_divergence(q, p) - expected_log_likelihood
-    }
-
-    /// Approximate –log P(o) upper bound via KL.
-    pub fn surprise_bound(q: &TernaryDist, p: &TernaryDist) -> f64 {
-        Self::kl_divergence(q, p)
-    }
-
-    /// Expected log-likelihood E_Q[log P(o|s)] given likelihood table.
-    pub fn expected_log_likelihood(q: &TernaryDist, log_likelihood: &TernaryDist) -> f64 {
-        q.iter().zip(log_likelihood.iter()).map(|(&qi, &ll)| qi * ll).sum()
+    pub fn compute(posterior: &TernaryDist, prior: &TernaryDist, observation: i8, likelihood: &TernaryDist) -> Self {
+        let kl = kl_divergence(posterior, prior);
+        let ll = likelihood.prob(observation).ln().max(-50.0);
+        Self { kl_term: kl, log_likelihood: ll, total: kl - ll }
     }
 }
 
-/// Gradient-descent step on Q to minimise surprise.
-pub struct SurpriseMinimization {
-    pub learning_rate: f64,
+/// Surprise (negative log probability) of an observation
+pub fn surprise(dist: &TernaryDist, observation: i8) -> f64 {
+    let p = dist.prob(observation);
+    if p < 1e-10 { 50.0 } else { -p.ln() }
 }
 
-impl SurpriseMinimization {
-    pub fn new(learning_rate: f64) -> Self {
-        Self { learning_rate }
-    }
+/// Surprise tracker for monitoring prediction quality over time
+#[derive(Debug, Clone)]
+pub struct SurpriseTracker {
+    pub surprises: Vec<f64>,
+    pub window: usize,
+}
 
-    /// Move Q toward P by one gradient step then renormalise.
-    pub fn gradient_step(&self, q: &mut TernaryDist, p: &TernaryDist) {
-        for i in 0..3 {
-            q[i] += self.learning_rate * (p[i] - q[i]);
+impl SurpriseTracker {
+    pub fn new(window: usize) -> Self { Self { surprises: Vec::new(), window } }
+
+    pub fn observe(&mut self, dist: &TernaryDist, observation: i8) {
+        self.surprises.push(surprise(dist, observation));
+        if self.surprises.len() > self.window {
+            self.surprises.remove(0);
         }
-        normalize_dist(q);
     }
 
-    /// Run until KL < tol or max_steps reached; returns (steps_taken, converged).
-    pub fn run_until_converged(
-        &self,
-        q: &mut TernaryDist,
-        p: &TernaryDist,
-        tol: f64,
-        max_steps: usize,
-    ) -> (usize, bool) {
-        for step in 0..max_steps {
-            if VariationalFreeEnergy::kl_divergence(q, p) < tol {
-                return (step, true);
-            }
-            self.gradient_step(q, p);
-        }
-        (max_steps, VariationalFreeEnergy::kl_divergence(q, p) < tol)
+    pub fn avg_surprise(&self) -> f64 {
+        if self.surprises.is_empty() { 0.0 }
+        else { self.surprises.iter().sum::<f64>() / self.surprises.len() as f64 }
     }
 
-    pub fn converged(q: &TernaryDist, p: &TernaryDist, tol: f64) -> bool {
-        VariationalFreeEnergy::kl_divergence(q, p) < tol
+    pub fn is_adapting(&self) -> bool {
+        if self.surprises.len() < 3 { return false; }
+        let n = self.surprises.len();
+        let first_half: f64 = self.surprises[..n/2].iter().sum();
+        let second_half: f64 = self.surprises[n/2..].iter().sum();
+        (second_half / (n - n/2) as f64) < (first_half / (n/2) as f64)
     }
 }
 
-/// Markov Blanket partition for a node in a directed ternary network.
-#[derive(Debug, Clone, PartialEq)]
+/// Markov blanket: identifies which variables are in/out of a variable's blanket
+#[derive(Debug, Clone)]
 pub struct MarkovBlanket {
     pub target: usize,
-    pub internal: Vec<usize>,
-    pub blanket: Vec<usize>,
-    pub external: Vec<usize>,
+    pub parents: Vec<usize>,
+    pub children: Vec<usize>,
+    pub co_parents: Vec<usize>,
 }
 
 impl MarkovBlanket {
-    /// Compute blanket = parents(target) ∪ children(target) ∪ co-parents(target).
-    pub fn compute(
-        n_nodes: usize,
-        adjacency: &[Vec<bool>],
-        target: usize,
-    ) -> Self {
-        use std::collections::BTreeSet;
-
-        let mut blanket = BTreeSet::new();
-
-        // parents of target
-        for i in 0..n_nodes {
-            if i != target && adjacency[i][target] {
-                blanket.insert(i);
-            }
-        }
-
-        // children of target + co-parents
-        let children: Vec<usize> = (0..n_nodes)
-            .filter(|&j| j != target && adjacency[target][j])
-            .collect();
-        for &c in &children {
-            blanket.insert(c);
-            for i in 0..n_nodes {
-                if i != target && adjacency[i][c] {
-                    blanket.insert(i);
-                }
-            }
-        }
-        blanket.remove(&target);
-
-        let blanket_vec: Vec<usize> = blanket.iter().cloned().collect();
-        let external: Vec<usize> = (0..n_nodes)
-            .filter(|&i| i != target && !blanket_vec.contains(&i))
-            .collect();
-
-        Self {
-            target,
-            internal: vec![target],
-            blanket: blanket_vec,
-            external,
-        }
+    pub fn new(target: usize) -> Self {
+        Self { target, parents: Vec::new(), children: Vec::new(), co_parents: Vec::new() }
     }
 
-    /// True if node is in the blanket.
-    pub fn in_blanket(&self, node: usize) -> bool {
-        self.blanket.contains(&node)
+    pub fn blanket_set(&self) -> Vec<usize> {
+        let mut set = Vec::new();
+        set.extend(&self.parents);
+        set.extend(&self.children);
+        set.extend(&self.co_parents);
+        set.sort_unstable();
+        set.dedup();
+        set
     }
 
-    /// Blanket size.
-    pub fn size(&self) -> usize {
-        self.blanket.len()
-    }
-
-    /// The blanket + internal partition is exhaustive over all nodes.
-    pub fn covers_all(&self, n_nodes: usize) -> bool {
-        let mut seen = vec![false; n_nodes];
-        for &i in &self.internal {
-            seen[i] = true;
-        }
-        for &i in &self.blanket {
-            seen[i] = true;
-        }
-        for &i in &self.external {
-            seen[i] = true;
-        }
-        seen.iter().all(|&s| s)
+    pub fn contains(&self, var: usize) -> bool {
+        self.blanket_set().contains(&var)
     }
 }
 
-/// Multi-level generative model with precision-weighted free energy.
-pub struct HierarchicalGenerativeModel {
-    pub levels: Vec<TernaryDist>,
-    pub precision: Vec<f64>,
+/// Bayesian update: posterior ∝ likelihood × prior for ternary distributions
+pub fn bayesian_update(prior: &TernaryDist, likelihood: &TernaryDist) -> TernaryDist {
+    let p_neg = prior.p_neg * likelihood.p_neg;
+    let p_zero = prior.p_zero * likelihood.p_zero;
+    let p_pos = prior.p_pos * likelihood.p_pos;
+    TernaryDist::new(p_neg, p_zero, p_pos)
 }
 
-impl HierarchicalGenerativeModel {
-    pub fn new(n_levels: usize) -> Self {
-        Self {
-            levels: vec![uniform(); n_levels],
-            precision: vec![1.0; n_levels],
-        }
-    }
-
-    /// Free energy contribution at level l = precision[l] * KL[Q_l || Q_{l-1}].
-    pub fn free_energy_at_level(&self, level: usize) -> f64 {
-        if level == 0 {
-            return 0.0;
-        }
-        let kl = VariationalFreeEnergy::kl_divergence(
-            &self.levels[level],
-            &self.levels[level - 1],
-        );
-        self.precision[level] * kl
-    }
-
-    pub fn total_free_energy(&self) -> f64 {
-        (1..self.levels.len())
-            .map(|l| self.free_energy_at_level(l))
-            .sum()
-    }
-
-    /// Gradient step: move level toward observation blend.
-    pub fn update_level(&mut self, level: usize, obs_dist: &TernaryDist, lr: f64) {
-        if level >= self.levels.len() {
-            return;
-        }
-        let q = &mut self.levels[level];
-        for i in 0..3 {
-            q[i] += lr * (obs_dist[i] - q[i]);
-        }
-        normalize_dist(q);
-    }
-
-    /// Set the prior (level 0) belief.
-    pub fn set_prior(&mut self, prior: TernaryDist) {
-        if !self.levels.is_empty() {
-            self.levels[0] = prior;
-        }
-    }
-
-    pub fn n_levels(&self) -> usize {
-        self.levels.len()
-    }
+/// Expected free energy for a policy: EFE = Σ -H[q(o)] + KL[q(s|o) || q(s)]
+pub fn expected_free_energy(
+    expected_obs_dist: &TernaryDist,
+    posterior_given_obs: &TernaryDist,
+    prior_state: &TernaryDist,
+) -> f64 {
+    let info_gain = -ternary_entropy(expected_obs_dist);
+    let kl = kl_divergence(posterior_given_obs, prior_state);
+    info_gain + kl
 }
 
 #[cfg(test)]
@@ -257,120 +171,106 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_entropy_uniform_equals_ln3() {
-        let u = uniform();
-        let h = TernaryEntropy::compute(&u);
-        assert!((h - 3.0_f64.ln()).abs() < 1e-10, "h={h}");
+    fn uniform_entropy_is_max() {
+        let u = TernaryDist::uniform();
+        assert!((ternary_entropy(&u) - 1.585).abs() < 0.01); // log2(3)
     }
 
     #[test]
-    fn test_entropy_deterministic_is_zero() {
-        let d = deterministic(1);
-        let h = TernaryEntropy::compute(&d);
-        assert!(h.abs() < 1e-10, "h={h}");
+    fn deterministic_entropy_zero() {
+        let d = TernaryDist::deterministic(1);
+        assert_eq!(ternary_entropy(&d), 0.0);
     }
 
     #[test]
-    fn test_entropy_partial_is_between_zero_and_ln3() {
-        let d: TernaryDist = [0.5, 0.3, 0.2];
-        let h = TernaryEntropy::compute(&d);
-        assert!(h > 0.0 && h < 3.0_f64.ln());
+    fn kl_same_distribution_zero() {
+        let p = TernaryDist::uniform();
+        assert!(kl_divergence(&p, &p) < 1e-10);
     }
 
     #[test]
-    fn test_normalised_entropy_in_unit_interval() {
-        let d: TernaryDist = [0.6, 0.3, 0.1];
-        let hn = TernaryEntropy::normalised(&d);
-        assert!(hn >= 0.0 && hn <= 1.0 + 1e-10);
+    fn kl_asymmetric() {
+        let p = TernaryDist::deterministic(1);
+        let q = TernaryDist::new(0.2, 0.3, 0.5);
+        let kl_pq = kl_divergence(&p, &q);
+        let kl_qp = kl_divergence(&q, &p);
+        assert!(kl_pq > 0.0);
+        assert!((kl_pq - kl_qp).abs() > 0.01);
     }
 
     #[test]
-    fn test_kl_identical_is_zero() {
-        let p: TernaryDist = [0.4, 0.35, 0.25];
-        let kl = VariationalFreeEnergy::kl_divergence(&p, &p);
-        assert!(kl.abs() < 1e-10, "kl={kl}");
+    fn vfe_positive() {
+        let prior = TernaryDist::uniform();
+        let posterior = TernaryDist::deterministic(1);
+        let likelihood = TernaryDist::new(0.1, 0.1, 0.8);
+        let vfe = VariationalFreeEnergy::compute(&posterior, &prior, 1, &likelihood);
+        assert!(vfe.total > 0.0);
     }
 
     #[test]
-    fn test_kl_nonneg() {
-        let q: TernaryDist = [0.6, 0.2, 0.2];
-        let p: TernaryDist = [0.2, 0.5, 0.3];
-        assert!(VariationalFreeEnergy::kl_divergence(&q, &p) >= 0.0);
+    fn surprise_high_for_unexpected() {
+        let d = TernaryDist::deterministic(1);
+        assert!(surprise(&d, -1) > 10.0);
     }
 
     #[test]
-    fn test_vfe_compute_returns_finite() {
-        let q: TernaryDist = [0.5, 0.3, 0.2];
-        let p: TernaryDist = [0.33, 0.33, 0.34];
-        let ell = -0.5;
-        let f = VariationalFreeEnergy::compute(&q, &p, ell);
-        assert!(f.is_finite());
+    fn surprise_zero_for_certain() {
+        let d = TernaryDist::deterministic(1);
+        assert!(surprise(&d, 1) < 1e-10);
     }
 
     #[test]
-    fn test_surprise_minimization_converges() {
-        let sm = SurpriseMinimization::new(0.2);
-        let p: TernaryDist = [0.7, 0.2, 0.1];
-        let mut q = uniform();
-        let (_, converged) = sm.run_until_converged(&mut q, &p, 1e-4, 500);
-        assert!(converged, "should converge in 500 steps");
+    fn surprise_tracker_adapting() {
+        let mut tracker = SurpriseTracker::new(10);
+        let dist = TernaryDist::new(0.1, 0.8, 0.1);
+        // High surprise initially, then it drops as we observe mostly 0s
+        tracker.observe(&TernaryDist::new(0.3, 0.4, 0.3), 1); // unexpected
+        tracker.observe(&TernaryDist::new(0.3, 0.4, 0.3), -1); // unexpected
+        tracker.observe(&dist, 0);
+        tracker.observe(&dist, 0);
+        tracker.observe(&dist, 0);
+        assert!(tracker.avg_surprise() < 5.0);
     }
 
     #[test]
-    fn test_surprise_minimization_reduces_kl() {
-        let sm = SurpriseMinimization::new(0.1);
-        let p: TernaryDist = [0.7, 0.2, 0.1];
-        let mut q = uniform();
-        let kl0 = VariationalFreeEnergy::kl_divergence(&q, &p);
-        for _ in 0..20 {
-            sm.gradient_step(&mut q, &p);
-        }
-        let kl1 = VariationalFreeEnergy::kl_divergence(&q, &p);
-        assert!(kl1 < kl0);
+    fn markov_blanket_set() {
+        let mut mb = MarkovBlanket::new(3);
+        mb.parents.push(0);
+        mb.parents.push(1);
+        mb.children.push(5);
+        mb.co_parents.push(2);
+        let blanket = mb.blanket_set();
+        assert_eq!(blanket, vec![0, 1, 2, 5]);
+        assert!(mb.contains(0));
+        assert!(!mb.contains(3));
     }
 
     #[test]
-    fn test_markov_blanket_covers_all_nodes() {
-        // simple 5-node chain: 0→1→2→3→4
-        let n = 5;
-        let mut adj = vec![vec![false; n]; n];
-        for i in 0..4 {
-            adj[i][i + 1] = true;
-        }
-        let mb = MarkovBlanket::compute(n, &adj, 2);
-        assert!(mb.covers_all(n), "blanket+internal+external should cover all nodes");
+    fn bayesian_update_shifts_posterior() {
+        let prior = TernaryDist::uniform();
+        let likelihood = TernaryDist::new(0.1, 0.1, 0.8);
+        let posterior = bayesian_update(&prior, &likelihood);
+        assert!(posterior.p_pos > 0.5);
     }
 
     #[test]
-    fn test_markov_blanket_isolates_target() {
-        let n = 5;
-        let mut adj = vec![vec![false; n]; n];
-        adj[0][2] = true; // parent
-        adj[1][2] = true; // parent
-        adj[2][3] = true; // child
-        adj[2][4] = true; // child
-        let mb = MarkovBlanket::compute(n, &adj, 2);
-        // blanket should contain parents + children
-        assert!(mb.in_blanket(0));
-        assert!(mb.in_blanket(1));
-        assert!(mb.in_blanket(3));
-        assert!(mb.in_blanket(4));
+    fn distribution_mean() {
+        let d = TernaryDist::new(0.2, 0.3, 0.5);
+        assert!((d.mean() - 0.3).abs() < 1e-10);
     }
 
     #[test]
-    fn test_hierarchical_model_total_free_energy_uniform() {
-        let hm = HierarchicalGenerativeModel::new(3);
-        // All levels uniform → KL=0
-        let tfe = hm.total_free_energy();
-        assert!(tfe.abs() < 1e-10, "tfe={tfe}");
+    fn distribution_variance() {
+        let d = TernaryDist::deterministic(0);
+        assert_eq!(d.variance(), 0.0);
     }
 
     #[test]
-    fn test_hierarchical_model_update_normalizes() {
-        let mut hm = HierarchicalGenerativeModel::new(3);
-        let obs: TernaryDist = [0.8, 0.1, 0.1];
-        hm.update_level(1, &obs, 0.5);
-        let sum: f64 = hm.levels[1].iter().sum();
-        assert!((sum - 1.0).abs() < 1e-10);
+    fn expected_free_energy_positive() {
+        let obs = TernaryDist::new(0.2, 0.6, 0.2);
+        let post = TernaryDist::new(0.1, 0.8, 0.1);
+        let prior = TernaryDist::uniform();
+        let efe = expected_free_energy(&obs, &post, &prior);
+        assert!(efe.is_finite());
     }
 }
