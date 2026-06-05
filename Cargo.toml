@@ -1,0 +1,8 @@
+[package]
+name = "ternary-free-energy"
+version = "0.1.0"
+edition = "2021"
+description = "Free Energy Principle computations for ternary distributions"
+license = "MIT"
+
+[dependencies]
